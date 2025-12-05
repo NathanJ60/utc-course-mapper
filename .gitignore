@@ -16,8 +16,11 @@ ENV/
 *.swo
 
 # Data
-data/chroma_db/
-*.db
+data/
+*.json
+
+# PDF catalogues (trop volumineux)
+catalogue-uv/*.pdf
 
 # Environment
 .env
