@@ -1,9 +1,13 @@
 import os
+import json
 import streamlit as st
 from openai import OpenAI
 from qdrant_client import QdrantClient
+from groq import Groq
 
 from config import QDRANT_DB_PATH, COLLECTION_NAME, EMBEDDING_MODEL
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 @st.cache_resource
@@ -31,6 +35,58 @@ def search_uv(query: str, openai_client: OpenAI, qdrant_client: QdrantClient, to
         limit=top_k
     ).points
     return results
+
+
+def analyze_with_llm(course_name: str, course_description: str, course_credits: int, matches: list[dict]) -> dict:
+    """Analyse le Top-K avec Groq et recommande la meilleure UV."""
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        return {"error": "GROQ_API_KEY non définie"}
+
+    client = Groq(api_key=groq_key)
+
+    uv_list = ""
+    for m in matches:
+        uv_list += f"""
+- [{m['code']}] {m['nom']}
+  Type: {m['type']} | Crédits: {m['credits']} | Score: {m['score']:.0%}
+  Description: {m['description'][:200] if m['description'] else 'N/A'}
+"""
+
+    prompt = f"""Tu es expert en équivalences de cours universitaires pour l'UTC.
+
+COURS ÉTRANGER:
+- Nom: {course_name}
+- Description: {course_description or 'Non fournie'}
+- Crédits: {course_credits} ECTS
+
+UV UTC CANDIDATES:
+{uv_list}
+
+Analyse ces UV et détermine laquelle correspond le mieux au cours étranger.
+Si aucune ne correspond vraiment, dis-le.
+
+Réponds en JSON:
+{{"is_match": true/false, "code": "CODE" ou null, "nom": "Nom UV" ou null, "justification": "2-3 phrases max"}}"""
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=500
+    )
+
+    content = response.choices[0].message.content
+
+    try:
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        if start != -1 and end > start:
+            return json.loads(content[start:end])
+    except json.JSONDecodeError:
+        pass
+
+    return {"error": "Impossible de parser la réponse", "raw": content}
 
 
 # Interface Streamlit
@@ -67,8 +123,37 @@ if st.button("🔍 Rechercher", type="primary", use_container_width=True):
         with st.spinner("Recherche en cours..."):
             results = search_uv(query, openai_client, qdrant_client, top_k)
 
+        # Préparer les données pour l'analyse LLM
+        matches = []
+        for i, r in enumerate(results, 1):
+            matches.append({
+                'rang': i,
+                'score': r.score,
+                'code': r.payload['code'],
+                'nom': r.payload['nom'],
+                'type': r.payload['type'],
+                'credits': r.payload['credits'],
+                'description': r.payload['description']
+            })
+
+        # Analyse LLM
+        with st.spinner("Analyse en cours..."):
+            analysis = analyze_with_llm(nom, description, credits, matches)
+
         st.divider()
-        st.subheader(f"Top {len(results)} UV correspondantes")
+
+        # Afficher la recommandation
+        if "error" in analysis:
+            st.warning(f"Erreur d'analyse: {analysis['error']}")
+        else:
+            if analysis.get('is_match'):
+                st.success(f"**Recommandation: [{analysis['code']}] {analysis['nom']}**")
+            else:
+                st.info("Aucune correspondance trouvée")
+            st.markdown(f"*{analysis.get('justification', 'N/A')}*")
+
+        st.divider()
+        st.subheader(f"Top {len(results)} UV candidates")
 
         for i, r in enumerate(results, 1):
             score_pct = int(r.score * 100)
